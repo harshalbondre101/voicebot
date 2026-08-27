@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Hindi Voicebot</title>
+  </head>
+  <body>
+    <main class="app">
+      <section class="console">
+        <header class="topbar">
+          <div>
+            <h1>Hindi Voicebot</h1>
+            <p id="stateText">Disconnected</p>
+          </div>
+          <div class="status-dot" id="statusDot"></div>
+        </header>
+
+        <label class="field">
+          <span>Pipecat backend URL</span>
+          <input id="backendUrl" placeholder="https://your-ngrok-url.ngrok-free.app" />
+        </label>
+
+        <div class="controls">
+          <button id="connectBtn">Start</button>
+          <button id="disconnectBtn" disabled>Stop</button>
+          <button id="muteBtn" disabled>Mute mic</button>
+        </div>
+
+        <div class="meters">
+          <div>
+            <span>Turn</span>
+            <strong id="turnState">Idle</strong>
+          </div>
+          <div>
+            <span>First audio</span>
+            <strong id="latencyValue">-</strong>
+          </div>
+        </div>
+
+        <section class="transcript" id="transcript" aria-live="polite"></section>
+      </section>
+    </main>
+    <script type="module" src="/src/main.js"></script>
+  </body>
+</html>

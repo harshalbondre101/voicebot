@@ -1,0 +1,17 @@
+{
+  "name": "hindi-voicebot-console",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0 --port 3000",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 3000"
+  },
+  "dependencies": {
+    "@pipecat-ai/client-js": "^1.10.0",
+    "@pipecat-ai/small-webrtc-transport": "^1.10.0",
+    "vite": "^6.0.0"
+  },
+  "devDependencies": {}
+}
