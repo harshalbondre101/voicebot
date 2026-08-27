@@ -3,13 +3,12 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-import tempfile
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-import soundfile as sf
+import torch
 from huggingface_hub import snapshot_download
 from loguru import logger
 from scipy.signal import resample_poly
@@ -52,8 +51,10 @@ class OratoTTSService(TTSService):
         self._sample_rate = sample_rate
         self._hf_token = hf_token or None
         self._engine: Any | None = None
-        self._ref_wav: Path | None = None
-        self._ref_text: str = ""
+        self._vocoder: Any | None = None
+        self._voices: dict[str, Any] = {}
+        self._snapshot_dir: Path | None = None
+        self._ref_cache: dict[str, tuple[Any, str]] = {}
         self._load_lock = asyncio.Lock()
 
     async def _ensure_engine(self) -> Any:
@@ -84,22 +85,77 @@ class OratoTTSService(TTSService):
             vocab = snap / "vocab.txt"
 
             try:
-                from f5_tts.api import F5TTS
+                from f5_tts.infer.utils_infer import load_vocoder
+                from f5_tts.model import CFM, DiT
+                from f5_tts.model.utils import get_tokenizer
             except Exception as exc:
                 raise RuntimeError(
-                    "F5-TTS is required for Orato TTS. In Colab run: "
-                    "pip install git+https://github.com/SWivid/F5-TTS.git"
+                    "AI4Bharat IndicF5 is required for Orato TTS. In Colab run: "
+                    "pip install git+https://github.com/AI4Bharat/IndicF5.git"
                 ) from exc
 
-            logger.info("Loading Orato/F5-TTS voice={} ckpt={}", self._voice, ckpt)
-            self._engine = await asyncio.to_thread(
-                F5TTS,
-                model="F5TTS_Base",
-                ckpt_file=str(ckpt),
-                vocab_file=str(vocab),
-                device=self._device,
-            )
+            def load_model() -> tuple[Any, Any]:
+                vocab_char_map, vocab_size = get_tokenizer(str(vocab), "custom")
+                model = CFM(
+                    transformer=DiT(
+                        dim=1024,
+                        depth=22,
+                        heads=16,
+                        ff_mult=2,
+                        text_dim=512,
+                        conv_layers=4,
+                        text_num_embeds=vocab_size,
+                        mel_dim=100,
+                    ),
+                    mel_spec_kwargs={
+                        "n_fft": 1024,
+                        "hop_length": 256,
+                        "win_length": 1024,
+                        "n_mel_channels": 100,
+                        "target_sample_rate": 24000,
+                        "mel_spec_type": "vocos",
+                    },
+                    odeint_kwargs={"method": "euler"},
+                    vocab_char_map=vocab_char_map,
+                )
+                checkpoint = torch.load(ckpt, map_location="cpu", weights_only=False)
+                model.load_state_dict(checkpoint["model_state_dict"], strict=True)
+                model = model.to(self._device)
+                model.eval()
+                vocoder = load_vocoder(vocoder_name="vocos", is_local=False, device=self._device)
+                return model, vocoder
+
+            logger.info("Loading Orato/IndicF5 voice={} ckpt={}", self._voice, ckpt)
+            self._engine, self._vocoder = await asyncio.to_thread(load_model)
+            self._voices = voices
+            self._snapshot_dir = snap
         return self._engine
+
+    async def _get_reference(self, voice: str) -> tuple[Any, str]:
+        if voice in self._ref_cache:
+            return self._ref_cache[voice]
+        await self._ensure_engine()
+        if self._snapshot_dir is None:
+            raise RuntimeError("Orato snapshot directory is not initialized")
+
+        try:
+            from f5_tts.infer.utils_infer import preprocess_ref_audio_text
+        except Exception as exc:
+            raise RuntimeError("AI4Bharat IndicF5 preprocessing utilities are unavailable") from exc
+
+        if voice not in self._voices:
+            raise ValueError(f"Unknown Orato voice '{voice}'. Available: {sorted(self._voices)}")
+
+        ref_wav = self._snapshot_dir / self._voices[voice]["wav"]
+        ref_text = self._voices[voice]["ref_text"]
+
+        reference = await asyncio.to_thread(
+            preprocess_ref_audio_text,
+            str(ref_wav),
+            ref_text,
+        )
+        self._ref_cache[voice] = reference
+        return reference
 
     def _split_text(self, text: str) -> list[str]:
         text = re.sub(r"\s+", " ", text).strip()
@@ -125,28 +181,29 @@ class OratoTTSService(TTSService):
         return (wav * 32767.0).astype(np.int16).tobytes()
 
     async def _synthesize(self, engine: Any, text: str) -> bytes:
-        if self._ref_wav is None:
-            raise RuntimeError("Orato reference voice is not initialized")
+        if self._vocoder is None:
+            raise RuntimeError("Orato vocoder is not initialized")
+        ref_audio, ref_text = await self._get_reference(self._voice)
+
+        try:
+            from f5_tts.infer.utils_infer import infer_process
+        except Exception as exc:
+            raise RuntimeError("AI4Bharat IndicF5 inference utilities are unavailable") from exc
 
         def infer() -> bytes:
-            result = engine.infer(
-                ref_file=str(self._ref_wav),
-                ref_text=self._ref_text,
+            audio_output, sample_rate_output, _ = infer_process(
+                ref_audio=ref_audio,
+                ref_text=ref_text,
                 gen_text=text,
+                model_obj=engine,
+                vocoder=self._vocoder,
+                mel_spec_type="vocos",
+                nfe_step=32,
+                cfg_strength=2.0,
+                speed=1.0,
+                device=self._device,
             )
-            if isinstance(result, tuple) and len(result) >= 2:
-                wav, rate = result[0], int(result[1])
-                return self._to_pcm16(np.asarray(wav, dtype=np.float32), rate)
-
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
-                engine.infer(
-                    ref_file=str(self._ref_wav),
-                    ref_text=self._ref_text,
-                    gen_text=text,
-                    file_wave=tmp.name,
-                )
-                wav, rate = sf.read(tmp.name, dtype="float32")
-                return self._to_pcm16(np.asarray(wav), int(rate))
+            return self._to_pcm16(np.asarray(audio_output, dtype=np.float32), int(sample_rate_output))
 
         return await asyncio.to_thread(infer)
 
